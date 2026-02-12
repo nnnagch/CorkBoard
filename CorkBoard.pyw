@@ -108,6 +108,19 @@ class FookMemoWidget(QWidget):
         self.reset_btn.clicked.connect(self.reset_view_to_center)
         self._layout_reset_button()
 
+        # ボード縁ドラッグでサイズ変更
+        self._resize_edge = None
+        self._resize_margin = 10
+        self._resizing_board = False
+        self._resize_start_mouse = QPointF(0, 0)
+        self._resize_start_board = (self.BOARD_W, self.BOARD_H)
+
+        # 右下リセットボタン
+        self.reset_btn = QPushButton("リセット", self)
+        self.reset_btn.setFixedSize(96, 34)
+        self.reset_btn.clicked.connect(self.reset_view_to_center)
+        self._layout_reset_button()
+
         # 右ドラッグでパン（右クリックメニュー抑制）
         self._rc_pressed = False
         self._rc_dragged = False
