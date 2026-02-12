@@ -2,6 +2,7 @@ import sys
 import unicodedata
 import copy
 import os
+import json
 import unittest
 
 from PySide6.QtWidgets import (
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QFileDialog,
     QMessageBox,
+    QPushButton,
 )
 from PySide6.QtGui import (
     QPainter,
@@ -27,6 +29,7 @@ from PySide6.QtGui import (
     QCloseEvent,
 )
 from PySide6.QtCore import Qt, QRect, QTimer, QPointF, Signal
+from PySide6.QtCore import QSettings, QStandardPaths
 
 
 class QFontMetricsCompat:
@@ -58,7 +61,8 @@ class FookMemoWidget(QWidget):
         self.BOARD_H = 800
 
         # ===== フォント =====
-        self.FONT = QFont("Consolas", 14)
+        self.BASE_FONT_SIZE = 14
+        self.FONT = QFont("Consolas", self.BASE_FONT_SIZE)
         fm = QFontMetricsCompat(self.FONT)
         self.SLOT_W = fm.h_advance("x")
         self.LINE_H = fm.line_spacing() + 2
@@ -85,10 +89,24 @@ class FookMemoWidget(QWidget):
         self.preedit_text = ""
 
         # ===== 表示（パン/ズーム） =====
-        self.zoom = 1.0
-        self.min_zoom = 0.25
-        self.max_zoom = 4.0
+        self.DEFAULT_ZOOM = 1.0
+        self.zoom = self.DEFAULT_ZOOM
         self.view_offset = QPointF(40.0, 40.0)
+        self._initialized_view = False
+        self._sync_font_to_zoom()
+
+        # ボード縁ドラッグでサイズ変更
+        self._resize_edge = None
+        self._resize_margin = 10
+        self._resizing_board = False
+        self._resize_start_mouse = QPointF(0, 0)
+        self._resize_start_board = (self.BOARD_W, self.BOARD_H)
+
+        # 右下リセットボタン
+        self.reset_btn = QPushButton("リセット", self)
+        self.reset_btn.setFixedSize(96, 34)
+        self.reset_btn.clicked.connect(self.reset_view_to_center)
+        self._layout_reset_button()
 
         # 右ドラッグでパン（右クリックメニュー抑制）
         self._rc_pressed = False
@@ -114,22 +132,27 @@ class FookMemoWidget(QWidget):
         # ===== ショートカット =====
         self._act_undo = QAction(self)
         self._act_undo.setShortcut(Qt.CTRL | Qt.Key_Z)
+        self._act_undo.setShortcutContext(Qt.WindowShortcut)
         self._act_undo.triggered.connect(self.undo)
 
         self._act_redo = QAction(self)
         self._act_redo.setShortcut(Qt.CTRL | Qt.Key_Y)
+        self._act_redo.setShortcutContext(Qt.WindowShortcut)
         self._act_redo.triggered.connect(self.redo)
 
         self._act_cut = QAction(self)
         self._act_cut.setShortcut(Qt.CTRL | Qt.Key_X)
+        self._act_cut.setShortcutContext(Qt.WindowShortcut)
         self._act_cut.triggered.connect(self.cut_selection)
 
         self._act_copy = QAction(self)
         self._act_copy.setShortcut(Qt.CTRL | Qt.Key_C)
+        self._act_copy.setShortcutContext(Qt.WindowShortcut)
         self._act_copy.triggered.connect(self.copy_selection)
 
         self._act_paste = QAction(self)
         self._act_paste.setShortcut(Qt.CTRL | Qt.Key_V)
+        self._act_paste.setShortcutContext(Qt.WindowShortcut)
         self._act_paste.triggered.connect(self.paste_selection)
 
         self.addAction(self._act_undo)
@@ -146,6 +169,13 @@ class FookMemoWidget(QWidget):
         if self._dirty != v:
             self._dirty = v
             self.dirtyChanged.emit(v)
+
+    def _sync_font_to_zoom(self):
+        self.FONT.setPointSizeF(max(1.0, self.BASE_FONT_SIZE * self.zoom))
+
+    def set_zoom(self, zoom: float):
+        self.zoom = max(0.01, float(zoom))
+        self._sync_font_to_zoom()
 
     # ===== 文字幅判定 =====
     def get_char_width(self, char: str) -> int:
@@ -302,6 +332,97 @@ class FookMemoWidget(QWidget):
         self.BOARD_H = self.ROWS * self.LINE_H
         for _ in range(add):
             self.model.append(["" for _ in range(self.COLS)])
+
+    def _resize_cols_to(self, new_cols: int):
+        new_cols = max(1, int(new_cols))
+        if new_cols == self.COLS:
+            return
+        if new_cols > self.COLS:
+            add = new_cols - self.COLS
+            for r in range(self.ROWS):
+                self.model[r].extend([""] * add)
+        else:
+            for r in range(self.ROWS):
+                self.model[r] = self.model[r][:new_cols]
+        self.COLS = new_cols
+        self.BOARD_W = self.COLS * self.SLOT_W
+        self.caret_col = min(self.caret_col, self.COLS - 1)
+        self.anchor_col = min(self.anchor_col, self.COLS - 1)
+
+    def _resize_rows_to(self, new_rows: int):
+        new_rows = max(1, int(new_rows))
+        if new_rows == self.ROWS:
+            return
+        if new_rows > self.ROWS:
+            add = new_rows - self.ROWS
+            for _ in range(add):
+                self.model.append(["" for _ in range(self.COLS)])
+        else:
+            self.model = self.model[:new_rows]
+        self.ROWS = new_rows
+        self.BOARD_H = self.ROWS * self.LINE_H
+        self.caret_row = min(self.caret_row, self.ROWS - 1)
+        self.anchor_row = min(self.anchor_row, self.ROWS - 1)
+
+    def _layout_reset_button(self):
+        margin = 18
+        self.reset_btn.move(self.width() - self.reset_btn.width() - margin, self.height() - self.reset_btn.height() - margin)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout_reset_button()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._initialized_view:
+            self.reset_view_to_center()
+            self._initialized_view = True
+
+    def reset_view_to_center(self):
+        if self.BOARD_W <= 0 or self.BOARD_H <= 0 or self.width() <= 0 or self.height() <= 0:
+            return
+        self.set_zoom(self.DEFAULT_ZOOM)
+        board_w_s = self.BOARD_W * self.zoom
+        board_h_s = self.BOARD_H * self.zoom
+        self.view_offset = QPointF(
+            (self.width() - board_w_s) / 2.0,
+            (self.height() - board_h_s) / 2.0,
+        )
+        self._initialized_view = True
+        self.update()
+
+    def get_view_state(self):
+        return {
+            "zoom": float(self.zoom),
+            "offset_x": float(self.view_offset.x()),
+            "offset_y": float(self.view_offset.y()),
+        }
+
+    def apply_view_state(self, state: dict | None):
+        if not state:
+            self.reset_view_to_center()
+            return
+        zoom = float(state.get("zoom", self.DEFAULT_ZOOM))
+        if zoom <= 0:
+            zoom = self.DEFAULT_ZOOM
+        self.set_zoom(zoom)
+        self.view_offset = QPointF(float(state.get("offset_x", 40.0)), float(state.get("offset_y", 40.0)))
+        self._initialized_view = True
+        self.update()
+
+    def _edge_at_pos(self, p: QPointF):
+        rect = self._board_rect_screen()
+        if not rect.adjusted(-self._resize_margin, -self._resize_margin, self._resize_margin, self._resize_margin).contains(int(p.x()), int(p.y())):
+            return None
+        near_right = abs(p.x() - rect.right()) <= self._resize_margin
+        near_bottom = abs(p.y() - rect.bottom()) <= self._resize_margin
+        if near_right and near_bottom:
+            return "corner"
+        if near_right:
+            return "right"
+        if near_bottom:
+            return "bottom"
+        return None
 
     # ===== グリッド位置計算（スクリーン座標→row,col） =====
     def slot_from_screen_if_in_board(self, sx: float, sy: float):
@@ -523,11 +644,8 @@ class FookMemoWidget(QWidget):
             return
 
         factor = 1.1 if delta > 0 else 1 / 1.1
-        new_zoom = max(self.min_zoom, min(self.max_zoom, self.zoom * factor))
-        if abs(new_zoom - self.zoom) < 1e-6:
-            return
-
-        self.zoom = new_zoom
+        new_zoom = self.zoom * factor
+        self.set_zoom(new_zoom)
         self.view_offset = mouse_s - before_c * self.zoom
         self.update()
 
@@ -543,8 +661,19 @@ class FookMemoWidget(QWidget):
             return
 
         if event.button() == Qt.LeftButton:
+            edge = self._edge_at_pos(event.position())
+            if edge is not None:
+                self.push_undo()
+                self._resizing_board = True
+                self._resize_edge = edge
+                self._resize_start_mouse = QPointF(event.position())
+                self._resize_start_board = (self.BOARD_W, self.BOARD_H)
+                return
+
             slot = self.slot_from_screen_if_in_board(event.position().x(), event.position().y())
             if slot is None:
+                self.anchor_row, self.anchor_col = self.caret_row, self.caret_col
+                self.update()
                 return
             self.caret_row, self.caret_col = slot
             if self.caret_col > 0 and self.model[self.caret_row][self.caret_col] is None:
@@ -563,7 +692,31 @@ class FookMemoWidget(QWidget):
             self._rc_dragged = False
             return
 
+        if event.button() == Qt.LeftButton and self._resizing_board:
+            self._resizing_board = False
+            self._resize_edge = None
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+            return
+
     def mouseMoveEvent(self, event):
+        if self._resizing_board:
+            delta = event.position() - self._resize_start_mouse
+            start_w, start_h = self._resize_start_board
+
+            target_w = start_w
+            target_h = start_h
+            if self._resize_edge in ("right", "corner"):
+                target_w = max(self.SLOT_W, start_w + delta.x() / self.zoom)
+            if self._resize_edge in ("bottom", "corner"):
+                target_h = max(self.LINE_H, start_h + delta.y() / self.zoom)
+
+            self._resize_cols_to(round(target_w / self.SLOT_W))
+            self._resize_rows_to(round(target_h / self.LINE_H))
+            self._normalize_rows(range(self.ROWS))
+            self.update()
+            return
+
         if self._rc_pressed and (event.buttons() & Qt.RightButton):
             if (event.position() - self._rc_press_pos).manhattanLength() > 3:
                 self._rc_dragged = True
@@ -575,6 +728,15 @@ class FookMemoWidget(QWidget):
         slot = self.slot_from_screen_if_in_board(event.position().x(), event.position().y())
         if slot is None:
             self.hover_visible = False
+            edge = self._edge_at_pos(event.position())
+            if edge == "corner":
+                self.setCursor(Qt.SizeFDiagCursor)
+            elif edge == "right":
+                self.setCursor(Qt.SizeHorCursor)
+            elif edge == "bottom":
+                self.setCursor(Qt.SizeVerCursor)
+            elif not self._rc_pressed:
+                self.setCursor(Qt.ArrowCursor)
             self.update()
             return
 
@@ -587,6 +749,9 @@ class FookMemoWidget(QWidget):
             self.caret_row = self.hover_row
             self.caret_col = self.hover_col
             self._snap_caret_off_none()
+
+        if not self._rc_pressed:
+            self.setCursor(Qt.ArrowCursor)
 
         self.update()
 
@@ -818,6 +983,27 @@ class FookMemoWidget(QWidget):
             lines.append(line.rstrip())
         return "\n".join(lines).rstrip("\n") + "\n"
 
+    def to_serializable(self) -> dict:
+        cells = []
+        for r in range(self.ROWS):
+            for c in range(self.COLS):
+                ch = self.model[r][c]
+                if ch in ("", None):
+                    continue
+                cells.append({"x": c, "y": r, "ch": ch})
+        return {
+            "format": "corkboard.v2",
+            "board": {"cols": self.COLS, "rows": self.ROWS},
+            "view": self.get_view_state(),
+            "cursor": {
+                "caret_row": self.caret_row,
+                "caret_col": self.caret_col,
+                "anchor_row": self.anchor_row,
+                "anchor_col": self.anchor_col,
+            },
+            "cells": cells,
+        }
+
     def load_plain_text(self, text: str):
         # 初期ボードに収まらないならロード時にも拡張
         lines = text.splitlines()
@@ -845,6 +1031,39 @@ class FookMemoWidget(QWidget):
         self.set_dirty(False)
         self.update()
 
+    def load_serializable(self, data: dict):
+        board = data.get("board", {})
+        cols = max(1, int(board.get("cols", self.COLS)))
+        rows = max(1, int(board.get("rows", self.ROWS)))
+
+        self.COLS = cols
+        self.ROWS = rows
+        self.BOARD_W = self.COLS * self.SLOT_W
+        self.BOARD_H = self.ROWS * self.LINE_H
+        self.model = [["" for _ in range(self.COLS)] for _ in range(self.ROWS)]
+
+        for cell in data.get("cells", []):
+            c = int(cell.get("x", -1))
+            r = int(cell.get("y", -1))
+            ch = cell.get("ch", "")
+            if 0 <= r < self.ROWS and 0 <= c < self.COLS and isinstance(ch, str) and ch:
+                self.model[r][c] = ch
+                if self.get_char_width(ch) == 2 and c + 1 < self.COLS:
+                    self.model[r][c + 1] = None
+
+        cursor = data.get("cursor", {})
+        self.caret_row = min(self.ROWS - 1, max(0, int(cursor.get("caret_row", 0))))
+        self.caret_col = min(self.COLS - 1, max(0, int(cursor.get("caret_col", 0))))
+        self.anchor_row = min(self.ROWS - 1, max(0, int(cursor.get("anchor_row", self.caret_row))))
+        self.anchor_col = min(self.COLS - 1, max(0, int(cursor.get("anchor_col", self.caret_col))))
+        self._snap_caret_off_none()
+        self.apply_view_state(data.get("view"))
+
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self.set_dirty(False)
+        self.update()
+
 
 class SettingsWidget(QWidget):
     def __init__(self, main_window):
@@ -855,15 +1074,6 @@ class SettingsWidget(QWidget):
         self.rb_light = QRadioButton("ライトモード")
         self.rb_comp = QRadioButton("コンピュータモード")
         self.rb_light.setChecked(True)
-
-        # 背景と同化しない indicator
-        self.setStyleSheet(
-            "QWidget { background: transparent; }"
-            "QRadioButton { padding: 8px; }"
-            "QRadioButton::indicator { width: 16px; height: 16px; }"
-            "QRadioButton::indicator:unchecked { border: 2px solid #405060; background: #ffffff; border-radius: 8px; }"
-            "QRadioButton::indicator:checked { border: 2px solid #405060; background: #2a78d7; border-radius: 8px; }"
-        )
 
         self.bg = QButtonGroup()
         self.bg.addButton(self.rb_light)
@@ -887,6 +1097,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._path = None
         self._mode = "light"
+        self._settings = QSettings("CorkBoard", "CorkBoard")
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -901,6 +1112,7 @@ class MainWindow(QMainWindow):
         # Save
         self._act_save = QAction(self)
         self._act_save.setShortcut(Qt.CTRL | Qt.Key_S)
+        self._act_save.setShortcutContext(Qt.WindowShortcut)
         self._act_save.triggered.connect(self.save)
         self.addAction(self._act_save)
 
@@ -931,21 +1143,7 @@ class MainWindow(QMainWindow):
         self._mode = mode
         self.editor.set_theme(mode)
 
-        if mode == "computer":
-            # 「黒基調」：指定色は固定しない（背景色を強制しない）
-            self.setStyleSheet(
-                "QTabWidget::pane { border: none; }"
-                "QTabBar::tab { padding: 8px 14px; }"
-            )
-        else:
-            # 「全体的に #C6B4A5 を調整した色」
-            self.setStyleSheet(
-                "QMainWindow { background-color: #C6B4A5; }"
-                "QWidget { background-color: rgba(198,180,165,180); }"
-                "QTabWidget::pane { border: none; background: rgba(198,180,165,140); }"
-                "QTabBar::tab { background: rgba(255,255,255,120); padding: 8px 14px; border-radius: 8px; margin: 4px; }"
-                "QTabBar::tab:selected { background: rgba(255,255,255,190); }"
-            )
+        self.setStyleSheet("")
 
         self.tabs.update()
         self.update()
@@ -953,9 +1151,17 @@ class MainWindow(QMainWindow):
     def open_file(self, path: str):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                text = f.read()
+                raw = f.read()
             self._path = path
-            self.editor.load_plain_text(text)
+            self._settings.setValue("last_save_dir", os.path.dirname(path))
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict) and data.get("format") == "corkboard.v2":
+                    self.editor.load_serializable(data)
+                else:
+                    self.editor.load_plain_text(raw)
+            except json.JSONDecodeError:
+                self.editor.load_plain_text(raw)
             self._update_title()
         except Exception:
             self._path = None
@@ -966,9 +1172,10 @@ class MainWindow(QMainWindow):
         if not self._path:
             return self.save_as()
         try:
-            text = self.editor.to_plain_text()
+            data = self.editor.to_serializable()
             with open(self._path, "w", encoding="utf-8") as f:
-                f.write(text)
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self._settings.setValue("last_save_dir", os.path.dirname(self._path))
             self.editor.set_dirty(False)
             self._update_title()
             return True
@@ -976,10 +1183,13 @@ class MainWindow(QMainWindow):
             return False
 
     def save_as(self):
+        default_dir = self._settings.value("last_save_dir", "", str)
+        if not default_dir:
+            default_dir = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
         path, _ = QFileDialog.getSaveFileName(
             self,
             "名前を付けて保存",
-            "",
+            default_dir,
             "Cork Files (*.cork)",
         )
         if not path:
@@ -996,7 +1206,7 @@ class MainWindow(QMainWindow):
 
         # 未保存確認ダイアログ
         box = QMessageBox(self)
-        box.setIcon(QMessageBox.Warning)
+        box.setIcon(QMessageBox.NoIcon)
         box.setWindowTitle("未保存")
         box.setText("変更が保存されていません。保存しますか？")
         btn_save = box.addButton("保存", QMessageBox.AcceptRole)
